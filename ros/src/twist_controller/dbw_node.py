@@ -32,9 +32,22 @@ that we have created in the `__init__` function.
 '''
 
 class DBWNode(object):
+    """ generate drive-by-wire(DBW) command for autonomous driving
+   
+        @subscribed /vehicle/dbw_enabled:  the indicator for whether the car is under dbw or driver control
+        @subscribed /current_velocity:     the vehicle's target linear velocities
+        @subscribed /twist_cmd:            the vehicle's target angular velocities
+
+        @published  /vehicle/brake_cmd:    the final brake for electronic control   
+        @published  /vehicle/throttle_cmd: the final throttle for electronic control  
+        @published  /vehicle/steering_cmd: the final steering for electronic control      
+    """
+    DBW_UPDATE_FREQ = 50 # Waypoint update frequency
+
     def __init__(self):
         rospy.init_node('dbw_node')
 
+        # load ego vehicle params:
         vehicle_mass = rospy.get_param('~vehicle_mass', 1736.35)
         fuel_capacity = rospy.get_param('~fuel_capacity', 13.5)
         brake_deadband = rospy.get_param('~brake_deadband', .1)
@@ -46,46 +59,102 @@ class DBWNode(object):
         max_lat_accel = rospy.get_param('~max_lat_accel', 3.)
         max_steer_angle = rospy.get_param('~max_steer_angle', 8.)
 
-        self.steer_pub = rospy.Publisher('/vehicle/steering_cmd',
-                                         SteeringCmd, queue_size=1)
-        self.throttle_pub = rospy.Publisher('/vehicle/throttle_cmd',
-                                            ThrottleCmd, queue_size=1)
-        self.brake_pub = rospy.Publisher('/vehicle/brake_cmd',
-                                         BrakeCmd, queue_size=1)
+        # state variables:
+        self.is_dbw_enabled = None
 
-        # TODO: Create `Controller` object
-        # self.controller = Controller(<Arguments you wish to provide>)
+        self.actual_longitudinal_velocity = None
+        
+        self.target_longitudinal_velocity = None
+        self.target_angular_velocity = None
 
-        # TODO: Subscribe to all the topics you need to
+        # controller object
+        self.controller = Controller(
+            vehicle_mass = vehicle_mass,
+            fuel_capacity = fuel_capacity,
+            brake_deadband = brake_deadband,
+            decel_limit = decel_limit,
+            accel_limit = accel_limit,
+            wheel_radius = wheel_radius,
+            wheel_base = wheel_base,
+            steer_ratio = steer_ratio,
+            max_lat_accel = max_lat_accel,
+            max_steer_angle = max_steer_angle
+        )
+
+        # subscribe:
+        rospy.Subscriber('/vehicle/dbw_enabled', Bool, self.dbw_enabled_cb)
+        rospy.Subscriber('/current_velocity', TwistStamped, self.current_velocity_cb)
+        rospy.Subscriber('/twist_cmd', TwistStamped, self.twist_cmd_cb)
+
+        # publish:
+        self.steer_pub = rospy.Publisher(
+            '/vehicle/steering_cmd',
+            SteeringCmd, queue_size=1
+        )
+        self.throttle_pub = rospy.Publisher(
+            '/vehicle/throttle_cmd',
+             ThrottleCmd, queue_size=1
+        )
+        self.brake_pub = rospy.Publisher(
+            '/vehicle/brake_cmd',
+            BrakeCmd, queue_size=1
+        )
 
         self.loop()
 
+    def dbw_enabled_cb(self, is_dbw_enabled):
+        """ update DBW activation status
+        """
+        self.is_dbw_enabled = is_dbw_enabled
+
+    def current_velocity_cb(self, current_velocity):
+        """ update waypoint velocities
+        """
+        self.actual_longitudinal_velocity = current_velocity.twist.linear.x
+
+    def twist_cmd_cb(self, target_velocity):
+        """ update twist command
+        """
+        self.target_longitudinal_velocity = target_velocity.twist.linear.x
+        self.target_angular_velocity = target_velocity.twist.angular.z
+
     def loop(self):
-        rate = rospy.Rate(50) # 50Hz
+        """ 
+            The DBW system on Carla expects messages at 50Hz
+            It will disengage (reverting control back to the driver) if control messages are published at less than 10hz
+        """
+        rate = rospy.Rate(DBWNode.DBW_UPDATE_FREQ) # at least 50Hz
         while not rospy.is_shutdown():
-            # TODO: Get predicted throttle, brake, and steering using `twist_controller`
-            # You should only publish the control commands if dbw is enabled
-            # throttle, brake, steering = self.controller.control(<proposed linear velocity>,
-            #                                                     <proposed angular velocity>,
-            #                                                     <current linear velocity>,
-            #                                                     <dbw status>,
-            #                                                     <any other argument you need>)
-            # if <dbw is enabled>:
-            #   self.publish(throttle, brake, steer)
+            # Get predicted throttle, brake, and steering using `twist_controller`
+            throttle, brake, steer = self.controller.control(
+                is_dbw_enabled = self.is_dbw_enabled,
+                actual_longitudinal_velocity = self.actual_longitudinal_velocity,
+                target_longitudinal_velocity = self.target_longitudinal_velocity,
+                target_angular_velocity = self.target_angular_velocity
+            )
+
+            # Only publish the control commands if dbw is enabled
+            if self.is_dbw_enabled:
+                self.publish(throttle, brake, steer)
             rate.sleep()
 
     def publish(self, throttle, brake, steer):
+        """ publish drive-by-wire(DBW) control command for autonomous driving
+        """
+        # throttle:
         tcmd = ThrottleCmd()
         tcmd.enable = True
         tcmd.pedal_cmd_type = ThrottleCmd.CMD_PERCENT
         tcmd.pedal_cmd = throttle
         self.throttle_pub.publish(tcmd)
 
+        # steering:
         scmd = SteeringCmd()
         scmd.enable = True
         scmd.steering_wheel_angle_cmd = steer
         self.steer_pub.publish(scmd)
 
+        # brake:
         bcmd = BrakeCmd()
         bcmd.enable = True
         bcmd.pedal_cmd_type = BrakeCmd.CMD_TORQUE
